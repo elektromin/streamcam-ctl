@@ -549,6 +549,7 @@ func cmdWatch(_ rest: ArraySlice<String>) {
 }
 
 // ---- main ----------------------------------------------------------------------
+setbuf(stdout, nil) // unbuffered stdout so `watch | tee log` streams live
 let args = Array(CommandLine.arguments)
 var idx = 1
 var withStream = false
