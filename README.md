@@ -1,4 +1,4 @@
-# streamcam-hack
+# streamcam-ctl
 
 Fix the Logitech StreamCam's overexposure (blown-out face highlights) on macOS by
 taking manual control of exposure — with a software auto-exposure loop that keeps
