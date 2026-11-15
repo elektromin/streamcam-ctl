@@ -8,6 +8,7 @@ lab/poller
 # logs from long watch runs
 watch-*.log
 *.log
+logs/
 
 # macOS
 .DS_Store
