@@ -89,13 +89,19 @@ const char *uvc_name(void) { return info.name; }
 int uvc_vid(void) { return info.vid; }
 int uvc_pid(void) { return info.pid; }
 
+/* Control transfers need explicit timeouts: a plain DeviceRequest on a wedged
+ * camera (USB stall after sleep/wake) can block the caller for minutes at a
+ * time, which stalled the whole watch loop (2026-11-16 log gaps). */
+#define UVC_REQ_TIMEOUT_MS 2000
+
 static IOReturn req(int unit, int in, int r, int sel, void *buf, int len) {
     if (!dev) return kIOReturnNotOpen;
-    IOUSBDevRequest q = {
+    IOUSBDevRequestTO q = {
         .bmRequestType = (UInt8)(in ? 0xA1 : 0x21), .bRequest = (UInt8)r,
         .wValue = (UInt16)(sel << 8), .wIndex = (UInt16)((lay.unitId[unit] << 8) | lay.vcIf),
-        .wLength = (UInt16)len, .pData = buf };
-    return (*dev)->DeviceRequest(dev, &q);
+        .wLength = (UInt16)len, .pData = buf,
+        .noDataTimeout = UVC_REQ_TIMEOUT_MS, .completionTimeout = UVC_REQ_TIMEOUT_MS };
+    return (*dev)->DeviceRequestTO(dev, &q);
 }
 
 int uvc_get(int unit, int sel, int r, int len, long *out) {
