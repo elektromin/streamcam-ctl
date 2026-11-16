@@ -95,9 +95,11 @@ final class FrameSink: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     var latest: Metrics?
     let gotFirst = DispatchSemaphore(value: 0)
     var everyN = 10
+    var lastFrameAt = Date() // heartbeat — used by the watch-loop stall watchdog
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         frameCount += 1
+        lastFrameAt = Date()
         let isSample = frameCount % everyN == 0
         if frameCount == 1, let pb0 = CMSampleBufferGetImageBuffer(sampleBuffer), getenv("SC_DEBUG") != nil {
             let fcc = CVPixelBufferGetPixelFormatType(pb0)
@@ -249,6 +251,19 @@ final class CameraStream {
     func stop() {
         if started { session.stopRunning(); started = false }
     }
+
+    /// Rebuild the session after the camera wedges/resets (USB trouble, sleep/wake).
+    /// A plain startRunning is not enough once the input's device has gone away.
+    func restart() -> Bool {
+        stop()
+        Thread.sleep(forTimeInterval: 0.3) // let the device settle before re-opening
+        while sink.gotFirst.wait(timeout: .now()) == .success {} // drain stale signals
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        for output in session.outputs { session.removeOutput(output) }
+        session.commitConfiguration()
+        return start()
+    }
 }
 
 // ---- UVC apply helpers -------------------------------------------------------
@@ -266,7 +281,12 @@ func uvcApply(_ c: Ctl, _ v0: Int, quiet: Bool = false) -> Bool {
     let before = uvcGet(c, GET_CUR)
     let e = uvc_set(c.unit, c.sel, c.len, v)
     if e != 0 {
-        print("✗ \(c.label): SET 0x\(String(e, radix: 16))" + (Int(e) == 0xe000404f ? " (stalled — camera rejected; needs an active stream?)" : ""))
+        // IOReturn codes are unsigned 32-bit; printing the signed Int32 directly
+        // renders 0xe000404f as the baffling "0x-1fffbfb1" (and Int(e) == 0xe000404f
+        // never matched, so the hint never showed).
+        let u = UInt32(bitPattern: e)
+        let hint = u == 0xe000404f ? " (USB transaction timeout — camera control pipe wedged)" : ""
+        print("✗ \(c.label): SET 0x\(String(u, radix: 16))\(hint)")
         return false
     }
     if let after = uvcGet(c, GET_CUR) {
@@ -325,8 +345,8 @@ func cmdStatus(withStream: Bool) {
         var line = "  \(c.label.padding(toLength: 44, withPad: " ", startingAt: 0)): "
         if let v = uvcGet(c, GET_CUR) {
             line += "\(v)"
-            if c.sel == CT_AE_MODE { line += "  [\(aeName(v))]" }
-            if c.sel == CT_EXPOSURE_ABS { line += "  [\(fmtShutter(v))]" }
+            if c.unit == UNIT_CT && c.sel == CT_AE_MODE { line += "  [\(aeName(v))]" }
+            if c.unit == UNIT_CT && c.sel == CT_EXPOSURE_ABS { line += "  [\(fmtShutter(v))]" }
         } else { line += "(get failed — try --stream)" }
         print(line)
     }
@@ -465,6 +485,10 @@ func cmdWatch(_ rest: ArraySlice<String>) {
     var tick = 0
     var lastMsg = ""
     var lastClipReact = Date.distantPast
+    var writeFailures = 0             // consecutive failed control writes → back off
+    var clipClearedSince: Date? = nil // clip hysteresis: face clearly un-clipped since
+    var lastStallLogged = Date.distantPast
+    var lastRestartAt = Date.distantPast
 
     while true {
         if duration > 0, Date().timeIntervalSince(start) > duration {
@@ -478,6 +502,22 @@ func cmdWatch(_ rest: ArraySlice<String>) {
             _ = aeModeSet(1)
             _ = uvcApply(Ctl(UNIT_PU, PU_WB_AUTO, 1, "WB auto"), wbAuto, quiet: true)
         }
+        // frame-stall watchdog: the capture session dies silently when the camera
+        // resets (USB trouble, sleep/wake) — this used to degrade into an hour of
+        // heal-only logging with no telemetry (2026-11-16, 13:36→15:01).
+        let frameAge = Date().timeIntervalSince(cam.sink.lastFrameAt)
+        if frameAge > 10 {
+            if Date().timeIntervalSince(lastStallLogged) > 10 {
+                lastStallLogged = Date()
+                print("⚠ no frames for \(Int(frameAge))s — capture session stalled (camera reset or USB trouble), restarting it")
+            }
+            if Date().timeIntervalSince(lastRestartAt) > 5 {
+                lastRestartAt = Date()
+                print(cam.restart() ? "✓ capture session restarted" : "✗ capture session restart failed — retrying (is the camera plugged in?)")
+            }
+            usleep(500000)
+            continue
+        }
         if Date().timeIntervalSince(lastSample) < 0.4 { usleep(20000); continue }
         lastSample = Date()
         tick += 1
@@ -488,10 +528,20 @@ func cmdWatch(_ rest: ArraySlice<String>) {
         let tooBright = m.median > target + 0.18
         let tooDark = m.median < target - 0.20
         let wayTooDark = m.median < target - 0.35
+        // clip hysteresis: only raise exposure again once the face has been clearly
+        // un-clipped for a couple of seconds — otherwise the loop flutters around the
+        // clip threshold (2026-11-16: ±5 gain flaps every ~2 s for a whole meeting)
+        if faceClip < 0.004 && m.near < 0.06 {
+            if clipClearedSince == nil { clipClearedSince = Date() }
+        } else {
+            clipClearedSince = nil
+        }
+        let exposureUpAllowed = clipClearedSince.map { Date().timeIntervalSince($0) > 2.0 } ?? false
         guard clipped || tooBright || tooDark || verbose else { continue }
         let recentlyClipped = Date().timeIntervalSince(lastClipReact) < 6
         let cooldown = clipped ? 0.8 : (wayTooDark ? 0.8 : recentlyClipped ? 2.2 : 1.5)
-        if Date().timeIntervalSince(lastChange) < cooldown { continue }
+        let backoff = Double(1 << min(writeFailures, 4)) // writes failing → retry slower
+        if Date().timeIntervalSince(lastChange) < cooldown * backoff { continue }
 
         var changed = ""
         if clipped {
@@ -512,17 +562,20 @@ func cmdWatch(_ rest: ArraySlice<String>) {
                 if ns != shutter { shutter = ns; changed = "darker" }
             }
         } else if wayTooDark {
-            if gain < gainMax { gain = min(gainMax, gain + 24); changed = "dark→gain↑↑" }
-            else {
+            if gain < gainMax {
+                if exposureUpAllowed { gain = min(gainMax, gain + 24); changed = "dark→gain↑↑" }
+            } else if exposureUpAllowed {
                 let ns = min(min(shutterCap, camMax), Int(Double(shutter) * 1.18))
                 if ns != shutter { shutter = ns; changed = "brighter" }
                 else { changed = "at limits (still dark)" }
             }
         } else if tooDark {
             if gain < gainMax {
-                gain = min(gainMax, gain + (recentlyClipped ? 4 : 8))
-                changed = recentlyClipped ? "gain↑ gentle" : "gain↑"
-            } else {
+                if exposureUpAllowed {
+                    gain = min(gainMax, gain + (recentlyClipped ? 4 : 8))
+                    changed = recentlyClipped ? "gain↑ gentle" : "gain↑"
+                }
+            } else if exposureUpAllowed {
                 let ns = min(min(shutterCap, camMax), Int(Double(shutter) * 1.18))
                 if ns != shutter { shutter = ns; changed = "brighter" }
                 else { changed = "at limits (still dark)" }
@@ -532,13 +585,19 @@ func cmdWatch(_ rest: ArraySlice<String>) {
             let msg = String(format: "[%@] med=%.2f clip=%.1f%% near=%.1f%% → %@ (shutter %@, gain %d)",
                              DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium),
                              m.median, m.clip * 100, m.near * 100, changed, fmtShutter(shutter), gain)
+            let shutterOK = uvcApply(exposureCtl, shutter, quiet: true)
+            let gainOK = uvcApply(gainCtl, gain, quiet: true)
+            // never let the model drift from the camera: on a failed SET, re-sync to
+            // what the camera actually has (the loop keeps retrying, with backoff)
+            if !shutterOK, let actual = uvcGet(exposureCtl, GET_CUR) { shutter = actual }
+            if !gainOK, let actual = uvcGet(gainCtl, GET_CUR) { gain = actual }
+            writeFailures = (!shutterOK || !gainOK) ? min(writeFailures + 1, 4) : 0
+            let full = msg + ((!shutterOK || !gainOK) ? " [write failed]" : "")
             if !(changed.hasPrefix("at limits") && lastMsg == msg) && !(changed.hasPrefix("at limits") && tick % 20 != 0) {
-                print(msg)
+                print(full)
             }
             lastMsg = msg
             lastChange = Date()
-            _ = uvcApply(exposureCtl, shutter, quiet: true)
-            _ = uvcApply(gainCtl, gain, quiet: true)
         } else if verbose, tick % 25 == 0 {
             print(String(format: "[%@] ok med=%.2f clip=%.1f%% near=%.1f%% (shutter %@, gain %d)",
                          DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium),
